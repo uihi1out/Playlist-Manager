@@ -1,0 +1,393 @@
+/* === Playlist Pro: replacement playlist viewer === */
+
+/* class applied to the specific YouTube section we're replacing.
+   Targeted to a precise element rather than a broad CSS selector. */
+.ytpp-hide-native {
+  display: none !important;
+}
+
+/* root container fills the right column where YouTube's list used to be */
+#ytpp-root {
+  font-family: 'Roboto', system-ui, -apple-system, sans-serif;
+  color: var(--yt-spec-text-primary, #0f0f0f);
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 0 12px 80px 12px;
+}
+html[dark] #ytpp-root {
+  color: var(--yt-spec-text-primary, #f1f1f1);
+}
+
+/* ---- header above the list (separate from YouTube's playlist header) ---- */
+.ytpp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 4px 12px 4px;
+  border-bottom: 1px solid var(--yt-spec-10-percent-layer, rgba(0, 0, 0, 0.1));
+  margin-bottom: 8px;
+}
+html[dark] .ytpp-header {
+  border-bottom-color: rgba(255, 255, 255, 0.12);
+}
+.ytpp-titles { min-width: 0; flex: 1; }
+.ytpp-h1 {
+  font-size: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ytpp-meta {
+  font-size: 12px;
+  color: var(--yt-spec-text-secondary, #606060);
+  margin-top: 2px;
+}
+html[dark] .ytpp-meta {
+  color: var(--yt-spec-text-secondary, #aaa);
+}
+
+/* ---- buttons ---- */
+.ytpp-btn {
+  background: var(--yt-spec-badge-chip-background, rgba(0, 0, 0, 0.05));
+  color: var(--yt-spec-text-primary, #0f0f0f);
+  border: 1px solid transparent;
+  border-radius: 18px;
+  padding: 7px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.12s, transform 0.05s, opacity 0.12s;
+  white-space: nowrap;
+}
+html[dark] .ytpp-btn {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--yt-spec-text-primary, #f1f1f1);
+}
+.ytpp-btn:hover:not(:disabled) {
+  background: rgba(255, 0, 51, 0.15);
+}
+html[dark] .ytpp-btn:hover:not(:disabled) {
+  background: rgba(255, 0, 51, 0.25);
+}
+.ytpp-btn:active:not(:disabled) { transform: scale(0.96); }
+.ytpp-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.ytpp-btn.ytpp-danger:hover:not(:disabled) {
+  background: rgba(220, 50, 50, 0.18);
+}
+
+/* ---- list container ---- */
+.ytpp-list {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ytpp-empty {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--yt-spec-text-secondary, #888);
+  font-size: 14px;
+}
+.ytpp-empty.ytpp-error {
+  color: #d32f2f;
+}
+
+/* ---- row ---- */
+.ytpp-row {
+  display: grid;
+  grid-template-columns: 32px 32px 168px 1fr 28px;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  cursor: default;
+  transition: background 0.1s;
+  min-width: 0;
+  /* Skip layout/paint for off-screen rows — playlists can have thousands
+     of rows, so this is the difference between instant and janky scrolling. */
+  content-visibility: auto;
+  /* Content-box height (94px thumb), NOT the full row: padding is added on
+     top. Overestimating made every unrendered row 12px too tall, so the page
+     jumped by ~20 rows as they rendered while scrolling up. */
+  contain-intrinsic-size: auto 94px;
+}
+.ytpp-row:hover {
+  background: var(--yt-spec-badge-chip-background, rgba(0, 0, 0, 0.05));
+}
+html[dark] .ytpp-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.ytpp-row.ytpp-selected {
+  background: rgba(255, 0, 51, 0.12) !important;
+  outline: 1px solid rgba(255, 0, 51, 0.4);
+  outline-offset: -1px;
+}
+
+.ytpp-row.ytpp-dragging {
+  opacity: 0.35;
+}
+
+/* hide checkbox column for non-owner playlists */
+#ytpp-root .ytpp-row:not(:has(.ytpp-check)) {
+  grid-template-columns: 0 32px 168px 1fr 28px;
+}
+
+/* checkbox */
+.ytpp-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.ytpp-check input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+  accent-color: #ff0033;
+  margin: 0;
+  /* Clicks go to the label, which owns selection. A direct click on the
+     input gets its toggle reverted by the label's preventDefault. */
+  pointer-events: none;
+}
+
+/* index number */
+.ytpp-num {
+  font-size: 13px;
+  text-align: center;
+  color: var(--yt-spec-text-secondary, #888);
+  font-variant-numeric: tabular-nums;
+}
+
+/* thumbnail */
+.ytpp-thumb-link {
+  position: relative;
+  display: block;
+  width: 168px;
+  height: 94px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+  text-decoration: none;
+}
+.ytpp-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.ytpp-thumb-time {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  background: rgba(0, 0, 0, 0.85);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* text */
+.ytpp-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ytpp-title {
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.3;
+  color: inherit;
+  text-decoration: none;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+.ytpp-title:hover { text-decoration: underline; }
+.ytpp-channel {
+  font-size: 12px;
+  color: var(--yt-spec-text-secondary, #606060);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+html[dark] .ytpp-channel {
+  color: var(--yt-spec-text-secondary, #aaa);
+}
+
+/* drag handle */
+.ytpp-grip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  color: var(--yt-spec-text-secondary, #888);
+  font-size: 16px;
+  padding: 4px;
+  border-radius: 4px;
+  user-select: none;
+}
+.ytpp-grip:hover {
+  background: rgba(0, 0, 0, 0.08);
+  color: var(--yt-spec-text-primary, #0f0f0f);
+}
+html[dark] .ytpp-grip:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+.ytpp-row[draggable="true"]:active .ytpp-grip {
+  cursor: grabbing;
+}
+
+/* drop insertion line — animates between positions */
+.ytpp-insertion-line {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  top: 0;
+  height: 3px;
+  background: #ff0033;
+  border-radius: 2px;
+  pointer-events: none;
+  opacity: 0;
+  transition: transform 0.06s ease-out, opacity 0.1s;
+  box-shadow: 0 0 8px rgba(255, 0, 51, 0.5);
+  z-index: 10;
+}
+
+/* drag ghost shown for multi-select moves */
+.ytpp-drag-ghost {
+  position: absolute;
+  top: -1000px;
+  left: -1000px;
+  background: #ff0033;
+  color: #fff;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: 'Roboto', system-ui, sans-serif;
+  pointer-events: none;
+}
+
+/* ---- floating action toolbar (shows when items selected) ---- */
+.ytpp-toolbar {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  background: rgba(15, 15, 15, 0.97);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  z-index: 99999;
+  font-size: 13px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  user-select: none;
+}
+.ytpp-toolbar[hidden] { display: none; }
+.ytpp-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+  background: rgba(15, 15, 15, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.55);
+}
+.ytpp-menu-item {
+  background: none;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: #fff;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ytpp-menu-item:hover, .ytpp-menu-item:focus-visible {
+  background: rgba(255, 255, 255, 0.12);
+  outline: none;
+}
+.ytpp-toolbar .ytpp-count {
+  font-weight: 600;
+  margin-right: 8px;
+  min-width: 80px;
+  font-variant-numeric: tabular-nums;
+}
+.ytpp-toolbar .ytpp-btn {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  padding: 7px 11px;
+  font-size: 12px;
+}
+.ytpp-toolbar .ytpp-btn:hover:not(:disabled) {
+  background: rgba(255, 0, 51, 0.3);
+  border-color: rgba(255, 0, 51, 0.6);
+}
+.ytpp-toolbar .ytpp-btn.ytpp-danger:hover:not(:disabled) {
+  background: rgba(220, 50, 50, 0.4);
+  border-color: rgba(220, 50, 50, 0.8);
+}
+
+/* ---- toast ---- */
+.ytpp-toast {
+  position: fixed;
+  bottom: 90px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(15, 15, 15, 0.95);
+  color: #fff;
+  padding: 10px 18px;
+  border-radius: 10px;
+  font-size: 13px;
+  z-index: 99998;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  animation: ytpp-toast-in 0.2s ease;
+}
+.ytpp-toast[hidden] { display: none; }
+.ytpp-toast[data-kind="error"] {
+  background: #c62828;
+}
+@keyframes ytpp-toast-in {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+/* ---- responsive narrowing ---- */
+@media (max-width: 900px) {
+  .ytpp-row {
+    grid-template-columns: 28px 24px 120px 1fr 24px;
+    gap: 8px;
+    contain-intrinsic-size: auto 68px; /* 68px thumb, same rule as above */
+  }
+  .ytpp-thumb-link { width: 120px; height: 68px; }
+}
