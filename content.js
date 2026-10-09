@@ -18,10 +18,11 @@
   // STATE
   // ============================================================
   const state = {
+    nextUid: 1,
     playlistId: null,
     ownerView: false,        // do we have setVideoId on rows? if so, we can reorder
-    videos: [],              // [{ videoId, setVideoId, title, channel, duration, durationSec, thumb, index }]
-    selected: new Set(),     // setVideoId values
+    videos: [],              // [{ videoId, setVideoId, uid, title, channel, duration, durationSec, thumb, index }]
+    selected: new Set(),     // uid values
     lastClickedId: null,
     rendering: false,
     busy: false,
@@ -243,6 +244,8 @@
     const index = parseInt(idxStr, 10) || 0;
     return {
       videoId: r.videoId,
+      uid: String(state.nextUid++),
+
       setVideoId: r.setVideoId || null,
       title, channel, duration, durationSec, thumb, index,
     };
@@ -635,13 +638,13 @@
   // RENDER LIST
   // ============================================================
   function buildRow(v, i) {
-    const isSelected = !!(v.setVideoId && state.selected.has(v.setVideoId));
+    const isSelected = !!(v.uid && state.selected.has(v.uid));
     const canDrag = !!(state.ownerView && v.setVideoId);
     const watchUrl = `/watch?v=${encodeURIComponent(v.videoId)}&list=${encodeURIComponent(state.playlistId)}&index=${i + 1}`;
 
     const children = [];
 
-    if (state.ownerView) {
+    if (v.uid) {
       const cb = h('input', { type: 'checkbox', tabindex: '-1' });
       cb.checked = isSelected;
       children.push(h('label', {
@@ -677,6 +680,8 @@
       role: 'option',
       'aria-selected': isSelected ? 'true' : 'false',
       dataset: {
+        uid: v.uid,
+
         setVideoId: v.setVideoId || '',
         videoId: v.videoId,
         index: String(i),
@@ -719,7 +724,7 @@
   function syncSelection() {
     if (!listEl) return;
     for (const row of listEl.children) {
-      const on = !!row.dataset.setVideoId && state.selected.has(row.dataset.setVideoId);
+      const on = !!row.dataset.uid && state.selected.has(row.dataset.uid);
       row.classList.toggle('ytpp-selected', on);
       row.setAttribute('aria-selected', on ? 'true' : 'false');
       const cb = row.querySelector('.ytpp-check input');
@@ -766,8 +771,25 @@
     const n = state.selected.size;
     toolbarEl.hidden = (n === 0);
     toolbarEl.querySelector('.ytpp-count').textContent = `${n} selected`;
+
+    const selectedVideos = state.videos.filter(v => state.selected.has(v.uid));
+    const allHaveSetVideoId = selectedVideos.every(v => !!v.setVideoId);
+    const hasValidAdd = selectedVideos.some(v => !!v.videoId);
+
     toolbarEl.querySelectorAll('button[data-act]').forEach(b => {
-      b.disabled = state.busy;
+      if (state.busy) {
+        b.disabled = true;
+        return;
+      }
+      const act = b.dataset.act;
+      if (act === 'clear') {
+        b.disabled = false;
+      } else if (act === 'add') {
+        b.disabled = !hasValidAdd;
+      } else {
+        // move, top, bottom, remove require ownerView and valid setVideoId for all selected items
+        b.disabled = !(state.ownerView && allHaveSetVideoId && selectedVideos.length > 0);
+      }
     });
   }
 
@@ -775,25 +797,25 @@
   // SELECTION
   // ============================================================
   function handleSelectClick(video, idx, ev) {
-    if (!video.setVideoId) return; // non-owner rows can't be selected
+    if (!video.uid) return; // shouldn\'t happen, but just in case
 
     if (ev.shiftKey && state.lastClickedId) {
-      const lastIdx = state.videos.findIndex(v => v.setVideoId === state.lastClickedId);
+      const lastIdx = state.videos.findIndex(v => v.uid === state.lastClickedId);
       if (lastIdx >= 0) {
         const [lo, hi] = lastIdx < idx ? [lastIdx, idx] : [idx, lastIdx];
-        const adding = !state.selected.has(video.setVideoId);
+        const adding = !state.selected.has(video.uid);
         for (let i = lo; i <= hi; i++) {
-          const sid = state.videos[i].setVideoId;
+          const sid = state.videos[i].uid;
           if (!sid) continue;
           if (adding) state.selected.add(sid);
           else state.selected.delete(sid);
         }
       }
     } else {
-      if (state.selected.has(video.setVideoId)) state.selected.delete(video.setVideoId);
-      else state.selected.add(video.setVideoId);
+      if (state.selected.has(video.uid)) state.selected.delete(video.uid);
+      else state.selected.add(video.uid);
     }
-    state.lastClickedId = video.setVideoId;
+    state.lastClickedId = video.uid;
     syncSelection();
   }
 
@@ -861,14 +883,14 @@
       // If the dragged row is part of the selection, drag the whole selection.
       // Otherwise, drag just this row (and clear selection).
       let movingIds;
-      if (state.selected.has(video.setVideoId)) {
+      if (state.selected.has(video.uid)) {
         movingIds = state.videos
-          .filter(v => v.setVideoId && state.selected.has(v.setVideoId))
+          .filter(v => v.setVideoId && state.selected.has(v.uid))
           .map(v => v.setVideoId);
       } else {
         movingIds = [video.setVideoId];
         state.selected.clear();
-        state.lastClickedId = video.setVideoId;
+        state.lastClickedId = video.uid;
       }
       dragState = { movingIds, sourceIdx: idx };
       e.dataTransfer.effectAllowed = 'move';
@@ -1004,10 +1026,19 @@
   // TOOLBAR ACTIONS
   // ============================================================
   async function handleToolbarAction(act) {
-    const ids = state.videos
-      .filter(v => v.setVideoId && state.selected.has(v.setVideoId))
+    const selectedUids = Array.from(state.selected);
+    const selectedVideos = state.videos.filter(v => state.selected.has(v.uid));
+
+    // For Move/Remove/Top/Bottom, we strictly need setVideoIds
+    const ids = selectedVideos
+      .filter(v => v.setVideoId)
       .map(v => v.setVideoId);
-    if (!ids.length && act !== 'clear') return;
+
+    // For Add, we only need valid videoIds
+    const validAddVideos = selectedVideos.filter(v => v.videoId);
+
+    if (act !== 'clear' && act !== 'add' && !ids.length) return;
+    if (act === 'add' && !validAddVideos.length) return;
 
     if (act === 'clear') {
       state.selected.clear();
@@ -1054,10 +1085,12 @@
 
     // 'add' and 'move' share everything up to removing from this playlist.
     if (act === 'add' || act === 'move') {
-      const selected = state.videos.filter(v => v.setVideoId && state.selected.has(v.setVideoId));
+      const activeVideos = act === 'add' ? validAddVideos : selectedVideos.filter(v => v.setVideoId);
+      if (!activeVideos.length) return;
+
       let target;
       try {
-        const playlists = (await fetchOwnPlaylists(selected[0].videoId))
+        const playlists = (await fetchOwnPlaylists(activeVideos[0].videoId))
           .filter(p => p.playlistId !== state.playlistId);
         if (!playlists.length) { showToast('No other playlists found', 'error'); return; }
         target = await pickPlaylist(playlists);
@@ -1073,15 +1106,16 @@
         // leaves duplicates, never lost videos.
         // ponytail: one request for the whole batch, chunk if huge selections start failing
         const addRes = await editPlaylist(
-          selected.map(v => ({ action: 'ACTION_ADD_VIDEO', addedVideoId: v.videoId })),
+          activeVideos.map(v => ({ action: 'ACTION_ADD_VIDEO', addedVideoId: v.videoId })),
           target.playlistId);
         if (addRes?.status && addRes.status !== 'STATUS_SUCCEEDED') {
           throw new Error(`couldn't add to "${target.title}" (${addRes.status})`);
         }
         if (act === 'add') {
+          const addedCount = activeVideos.length;
           state.selected.clear();
           syncSelection();
-          showToast(`Added ${ids.length} to "${target.title}"`);
+          showToast(`Added ${addedCount} to "${target.title}"`);
           return;
         }
         const removeSet = new Set(ids);
@@ -1145,6 +1179,7 @@
     if (!isPlaylistPage()) { unmountRoot(); return; }
     const playlistId = new URLSearchParams(location.search).get('list');
     state.playlistId = playlistId;
+    state.nextUid = 1;
     state.selected.clear();
     state.lastClickedId = null;
     state.videos = [];
