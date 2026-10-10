@@ -18,10 +18,11 @@
   // STATE
   // ============================================================
   const state = {
+    nextUid: 1,
     playlistId: null,
     ownerView: false,        // do we have setVideoId on rows? if so, we can reorder
-    videos: [],              // [{ videoId, setVideoId, title, channel, duration, durationSec, thumb, index }]
-    selected: new Set(),     // setVideoId values
+    videos: [],              // [{ videoId, setVideoId, uid, title, channel, duration, durationSec, thumb, index }]
+    selected: new Set(),     // uid values
     lastClickedId: null,
     rendering: false,
     busy: false,
@@ -188,20 +189,36 @@
   // and return the playlistVideoListRenderer for the playlist we're on.
   function findPlaylistListInBrowse(d) {
     if (!d) return null;
-    const tabs = d?.contents?.twoColumnBrowseResultsRenderer?.tabs;
-    if (!tabs) return null;
-    for (const t of tabs) {
-      const sec = t?.tabRenderer?.content?.sectionListRenderer?.contents;
-      if (!sec) continue;
-      for (const s of sec) {
-        const inner = s?.itemSectionRenderer?.contents;
-        if (!inner) continue;
-        for (const it of inner) {
-          if (it.playlistVideoListRenderer) return it.playlistVideoListRenderer;
-        }
+    // Walk the tree instead of relying on a brittle path.
+    // Different playlist types (mixes, recaps, user playlists) nest their lists differently.
+    let found = null;
+    (function walk(obj) {
+      if (found || !obj || typeof obj !== 'object') return;
+      if (obj.playlistVideoListRenderer) {
+        found = obj.playlistVideoListRenderer;
+        return;
       }
-    }
-    return null;
+      if (obj.playlistPanelRenderer) {
+        // Some mixes render as a panel
+        found = obj.playlistPanelRenderer;
+        return;
+      }
+      if (obj.sectionListRenderer) {
+        // If it's a section list, we might want to capture the whole thing if it contains playlist videos,
+        // but `collectVideosDeep` will find `playlistVideoRenderer`s anywhere.
+        // Returning the container that holds the videos is enough.
+        // We will just keep searching inside.
+      }
+      for (const k in obj) {
+        walk(obj[k]);
+      }
+    })(d);
+
+    // If we didn't find a dedicated playlist list renderer, but we DID find
+    // something containing `playlistVideoRenderer`s or `playlistPanelVideoRenderer`s,
+    // we can just return the entire document as the "list data" and let `extractVideos`
+    // find them. `extractVideos` already searches deeply!
+    return found || d;
   }
 
   function getInitialPlaylistList() {
@@ -230,7 +247,38 @@
 
 
   function parseRow(r) {
-    if (!r || !r.videoId) return null;
+    if (!r) return null;
+
+    // Support for lockupViewModel
+    if (r.contentId) {
+      // Exclude generic IDs that aren't YouTube video IDs (typically length 11)
+      if (typeof r.contentId !== 'string' || r.contentId.length !== 11) return null;
+
+      const videoId = r.contentId;
+      const meta = r.metadata?.lockupMetadataViewModel || {};
+      const title = meta.title?.content || '';
+      // We don't want "Play All" or "Shuffle" generic collections to be parsed as videos
+      if (!title || title.toLowerCase() === 'play all' || title.toLowerCase() === 'shuffle') return null;
+
+      // Additional lockup parsing if needed
+      const thumbObj = r.image?.imageViewModel?.image?.sources?.[0];
+      const thumb = thumbObj ? thumbObj.url : `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
+
+      const channel = meta.metadata?.content || '';
+      // Lockups don't explicitly pass index in all cases, nor strict duration directly reliably in the same schema
+      const index = 0;
+      const duration = '';
+      const durationSec = 0;
+
+      return {
+        videoId,
+        uid: String(state.nextUid++),
+        setVideoId: null, // Generated/Recap items are read-only
+        title, channel, duration, durationSec, thumb, index
+      };
+    }
+
+    if (!r.videoId) return null;
     const titleRuns = r.title?.runs || [];
     const title = titleRuns.map(x => x.text).join('') || r.title?.simpleText || '';
     const channel = r.shortBylineText?.runs?.[0]?.text ||
@@ -243,6 +291,8 @@
     const index = parseInt(idxStr, 10) || 0;
     return {
       videoId: r.videoId,
+      uid: String(state.nextUid++),
+
       setVideoId: r.setVideoId || null,
       title, channel, duration, durationSec, thumb, index,
     };
@@ -251,7 +301,7 @@
   // Recursively search any object for the first continuation token we can find.
   // Used as a fallback when the path varies between YouTube backend versions.
   function findContinuationTokenDeep(obj, depth = 0) {
-    if (!obj || typeof obj !== 'object' || depth > 8) return null;
+    if (!obj || typeof obj !== 'object' || depth > 20) return null;
     // Direct hits we know about
     if (obj.continuationCommand?.token) return obj.continuationCommand.token;
     if (obj.nextContinuationData?.continuation) return obj.nextContinuationData.continuation;
@@ -277,14 +327,22 @@
   // reloadContinuationItemsCommand / continuationContents / whatever ships
   // next quarter) because those vary by backend version and an unrecognized
   // one silently truncated the playlist at the first page.
-  function collectVideosDeep(obj, out = [], depth = 0) {
+  function collectVideosDeep(obj, out = [], depth = 0, seen = new Set()) {
     if (!obj || typeof obj !== 'object' || depth > 16) return out;
-    if (obj.playlistVideoRenderer) {
-      const v = parseRow(obj.playlistVideoRenderer);
-      if (v) out.push(v);
-      return out; // no videos nested inside a video
+    const renderer = obj.playlistVideoRenderer || obj.playlistPanelVideoRenderer || obj.videoRenderer || obj.lockupViewModel;
+    if (renderer) {
+      // Normal renderers have videoId, lockupViewModel has contentId
+      const id = renderer.videoId || renderer.contentId;
+      if (id && !seen.has(id)) {
+        const v = parseRow(renderer);
+        if (v) {
+          seen.add(id);
+          out.push(v);
+        }
+        return out; // no videos nested inside a video
+      }
     }
-    for (const k in obj) collectVideosDeep(obj[k], out, depth + 1);
+    for (const k in obj) collectVideosDeep(obj[k], out, depth + 1, seen);
     return out;
   }
 
@@ -295,6 +353,67 @@
       videos: collectVideosDeep(json),
       continuationToken: findContinuationTokenDeep(json),
     };
+  }
+
+  // Fallback DOM scraper for playlists (like Recaps) where InnerTube API fails or hides the renderer schema
+  function scrapeVideosFromDom() {
+    const anchors = Array.from(document.querySelectorAll('a[href*="/watch?v="]'));
+    const uniqueIds = new Set();
+    const videos = [];
+    let index = 0;
+
+    for (const a of anchors) {
+      // Exclude "Play All", "Shuffle" and other non-video links by checking href/text
+      const url = new URL(a.href, window.location.origin);
+      const videoId = url.searchParams.get('v');
+      if (!videoId) continue;
+
+      const title = a.textContent.trim() || a.title;
+      if (!title || title.toLowerCase() === 'play all' || title.toLowerCase() === 'shuffle') continue;
+
+      // We only want the main video link. Usually videos are wrapped in a container that has the thumbnail and title.
+      // A safe way to find a stable row boundary is getting the closest common ancestor (like a 'ytd-playlist-video-renderer'
+      // or 'ytd-compact-video-renderer', or just a block element).
+      // For deduplication, we rely on the videoId.
+      if (uniqueIds.has(videoId)) continue;
+      uniqueIds.add(videoId);
+
+      // Find duration if possible
+      let durationStr = '';
+      const row = a.closest('ytd-playlist-video-renderer, ytd-compact-video-renderer, ytd-grid-video-renderer, ytd-rich-item-renderer, ytd-playlist-panel-video-renderer') || a.parentElement;
+      if (row) {
+         const timeEl = row.querySelector('ytd-thumbnail-overlay-time-status-renderer, .ytd-thumbnail-overlay-time-status-renderer');
+         if (timeEl) durationStr = timeEl.textContent.trim();
+      }
+
+      let durationSec = 0;
+      if (durationStr) {
+         const parts = durationStr.split(':').reverse();
+         if (parts[0]) durationSec += parseInt(parts[0], 10) || 0;
+         if (parts[1]) durationSec += (parseInt(parts[1], 10) || 0) * 60;
+         if (parts[2]) durationSec += (parseInt(parts[2], 10) || 0) * 3600;
+      }
+
+      // Find thumbnail
+      let thumb = `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
+      const img = row ? row.querySelector('img') : a.querySelector('img');
+      if (img && img.src && img.src.includes('ytimg.com')) {
+          thumb = img.src;
+      }
+
+      // Find channel
+      let channel = '';
+      const byline = row ? row.querySelector('ytd-channel-name, .ytd-channel-name') : null;
+      if (byline) channel = byline.textContent.replace(/\s+/g, ' ').trim();
+
+      videos.push({
+        videoId,
+        uid: String(state.nextUid++),
+        setVideoId: null, // DOM scraped items are strictly read-only capabilities
+        title, channel, duration: durationStr, durationSec, thumb, index: index++
+      });
+    }
+    return videos;
   }
 
   // Fetches continuation pages one at a time (YouTube requires the previous
@@ -462,9 +581,23 @@
   function findNativePlaylistSection() {
     // The list renderer itself (the most specific match)
     const listRenderer = document.querySelector(
-      'ytd-browse[page-subtype="playlist"] ytd-playlist-video-list-renderer'
+      'ytd-browse[page-subtype="playlist"] ytd-playlist-video-list-renderer, ' +
+      'ytd-playlist-video-list-renderer, ' +
+      'ytd-playlist-panel-renderer, ' +
+      'ytd-section-list-renderer[page-subtype="playlist"]'
     );
-    if (!listRenderer) return null;
+    if (!listRenderer) {
+      // Fallback: look for the main content area if we are on a /playlist page but lack known renderers
+      // Some generated lists render as standard section lists without page-subtype
+      if (isPlaylistPage()) {
+         const fallback = document.querySelector('ytd-browse ytd-section-list-renderer') ||
+                          document.querySelector('ytd-browse[page-subtype="playlist"] #primary') ||
+                          document.querySelector('ytd-playlist-panel-renderer') ||
+                          document.querySelector('ytd-browse');
+         if (fallback) return fallback.closest('ytd-item-section-renderer') || fallback;
+      }
+      return null;
+    }
     // Walk up to its containing item-section so we hide the whole block
     // (including the section header, etc.), not just the list rows.
     return listRenderer.closest('ytd-item-section-renderer') || listRenderer;
@@ -635,13 +768,13 @@
   // RENDER LIST
   // ============================================================
   function buildRow(v, i) {
-    const isSelected = !!(v.setVideoId && state.selected.has(v.setVideoId));
+    const isSelected = !!(v.uid && state.selected.has(v.uid));
     const canDrag = !!(state.ownerView && v.setVideoId);
     const watchUrl = `/watch?v=${encodeURIComponent(v.videoId)}&list=${encodeURIComponent(state.playlistId)}&index=${i + 1}`;
 
     const children = [];
 
-    if (state.ownerView) {
+    if (v.uid) {
       const cb = h('input', { type: 'checkbox', tabindex: '-1' });
       cb.checked = isSelected;
       children.push(h('label', {
@@ -677,6 +810,8 @@
       role: 'option',
       'aria-selected': isSelected ? 'true' : 'false',
       dataset: {
+        uid: v.uid,
+
         setVideoId: v.setVideoId || '',
         videoId: v.videoId,
         index: String(i),
@@ -719,7 +854,7 @@
   function syncSelection() {
     if (!listEl) return;
     for (const row of listEl.children) {
-      const on = !!row.dataset.setVideoId && state.selected.has(row.dataset.setVideoId);
+      const on = !!row.dataset.uid && state.selected.has(row.dataset.uid);
       row.classList.toggle('ytpp-selected', on);
       row.setAttribute('aria-selected', on ? 'true' : 'false');
       const cb = row.querySelector('.ytpp-check input');
@@ -766,8 +901,25 @@
     const n = state.selected.size;
     toolbarEl.hidden = (n === 0);
     toolbarEl.querySelector('.ytpp-count').textContent = `${n} selected`;
+
+    const selectedVideos = state.videos.filter(v => state.selected.has(v.uid));
+    const allHaveSetVideoId = selectedVideos.every(v => !!v.setVideoId);
+    const hasValidAdd = selectedVideos.some(v => !!v.videoId);
+
     toolbarEl.querySelectorAll('button[data-act]').forEach(b => {
-      b.disabled = state.busy;
+      if (state.busy) {
+        b.disabled = true;
+        return;
+      }
+      const act = b.dataset.act;
+      if (act === 'clear') {
+        b.disabled = false;
+      } else if (act === 'add') {
+        b.disabled = !hasValidAdd;
+      } else {
+        // move, top, bottom, remove require ownerView and valid setVideoId for all selected items
+        b.disabled = !(state.ownerView && allHaveSetVideoId && selectedVideos.length > 0);
+      }
     });
   }
 
@@ -775,25 +927,25 @@
   // SELECTION
   // ============================================================
   function handleSelectClick(video, idx, ev) {
-    if (!video.setVideoId) return; // non-owner rows can't be selected
+    if (!video.uid) return; // shouldn\'t happen, but just in case
 
     if (ev.shiftKey && state.lastClickedId) {
-      const lastIdx = state.videos.findIndex(v => v.setVideoId === state.lastClickedId);
+      const lastIdx = state.videos.findIndex(v => v.uid === state.lastClickedId);
       if (lastIdx >= 0) {
         const [lo, hi] = lastIdx < idx ? [lastIdx, idx] : [idx, lastIdx];
-        const adding = !state.selected.has(video.setVideoId);
+        const adding = !state.selected.has(video.uid);
         for (let i = lo; i <= hi; i++) {
-          const sid = state.videos[i].setVideoId;
+          const sid = state.videos[i].uid;
           if (!sid) continue;
           if (adding) state.selected.add(sid);
           else state.selected.delete(sid);
         }
       }
     } else {
-      if (state.selected.has(video.setVideoId)) state.selected.delete(video.setVideoId);
-      else state.selected.add(video.setVideoId);
+      if (state.selected.has(video.uid)) state.selected.delete(video.uid);
+      else state.selected.add(video.uid);
     }
-    state.lastClickedId = video.setVideoId;
+    state.lastClickedId = video.uid;
     syncSelection();
   }
 
@@ -861,14 +1013,14 @@
       // If the dragged row is part of the selection, drag the whole selection.
       // Otherwise, drag just this row (and clear selection).
       let movingIds;
-      if (state.selected.has(video.setVideoId)) {
+      if (state.selected.has(video.uid)) {
         movingIds = state.videos
-          .filter(v => v.setVideoId && state.selected.has(v.setVideoId))
+          .filter(v => v.setVideoId && state.selected.has(v.uid))
           .map(v => v.setVideoId);
       } else {
         movingIds = [video.setVideoId];
         state.selected.clear();
-        state.lastClickedId = video.setVideoId;
+        state.lastClickedId = video.uid;
       }
       dragState = { movingIds, sourceIdx: idx };
       e.dataTransfer.effectAllowed = 'move';
@@ -1004,10 +1156,19 @@
   // TOOLBAR ACTIONS
   // ============================================================
   async function handleToolbarAction(act) {
-    const ids = state.videos
-      .filter(v => v.setVideoId && state.selected.has(v.setVideoId))
+    const selectedUids = Array.from(state.selected);
+    const selectedVideos = state.videos.filter(v => state.selected.has(v.uid));
+
+    // For Move/Remove/Top/Bottom, we strictly need setVideoIds
+    const ids = selectedVideos
+      .filter(v => v.setVideoId)
       .map(v => v.setVideoId);
-    if (!ids.length && act !== 'clear') return;
+
+    // For Add, we only need valid videoIds
+    const validAddVideos = selectedVideos.filter(v => v.videoId);
+
+    if (act !== 'clear' && act !== 'add' && !ids.length) return;
+    if (act === 'add' && !validAddVideos.length) return;
 
     if (act === 'clear') {
       state.selected.clear();
@@ -1025,7 +1186,7 @@
         const actions = buildMoveActions(previous, ids, 0);
         await editPlaylist(actions);
         showToast(`Moved ${ids.length} to top`);
-      } catch (err) {
+    } catch (err) {
         await reload(); // reload to be safe on error
         showToast(`Failed: ${err.message}`, 'error');
       } finally {
@@ -1043,7 +1204,7 @@
         const actions = buildMoveActions(previous, ids, previous.length);
         await editPlaylist(actions);
         showToast(`Moved ${ids.length} to bottom`);
-      } catch (err) {
+    } catch (err) {
         await reload();
         showToast(`Failed: ${err.message}`, 'error');
       } finally {
@@ -1054,14 +1215,16 @@
 
     // 'add' and 'move' share everything up to removing from this playlist.
     if (act === 'add' || act === 'move') {
-      const selected = state.videos.filter(v => v.setVideoId && state.selected.has(v.setVideoId));
+      const activeVideos = act === 'add' ? validAddVideos : selectedVideos.filter(v => v.setVideoId);
+      if (!activeVideos.length) return;
+
       let target;
       try {
-        const playlists = (await fetchOwnPlaylists(selected[0].videoId))
+        const playlists = (await fetchOwnPlaylists(activeVideos[0].videoId))
           .filter(p => p.playlistId !== state.playlistId);
         if (!playlists.length) { showToast('No other playlists found', 'error'); return; }
         target = await pickPlaylist(playlists);
-      } catch (err) {
+    } catch (err) {
         showToast(`Couldn't load playlists: ${err.message}`, 'error');
         return;
       }
@@ -1073,15 +1236,16 @@
         // leaves duplicates, never lost videos.
         // ponytail: one request for the whole batch, chunk if huge selections start failing
         const addRes = await editPlaylist(
-          selected.map(v => ({ action: 'ACTION_ADD_VIDEO', addedVideoId: v.videoId })),
+          activeVideos.map(v => ({ action: 'ACTION_ADD_VIDEO', addedVideoId: v.videoId })),
           target.playlistId);
         if (addRes?.status && addRes.status !== 'STATUS_SUCCEEDED') {
           throw new Error(`couldn't add to "${target.title}" (${addRes.status})`);
         }
         if (act === 'add') {
+          const addedCount = activeVideos.length;
           state.selected.clear();
           syncSelection();
-          showToast(`Added ${ids.length} to "${target.title}"`);
+          showToast(`Added ${addedCount} to "${target.title}"`);
           return;
         }
         const removeSet = new Set(ids);
@@ -1090,7 +1254,7 @@
         renderList();
         await editPlaylist(ids.map(setVideoId => ({ action: 'ACTION_REMOVE_VIDEO', setVideoId })));
         showToast(`Moved ${ids.length} to "${target.title}"`);
-      } catch (err) {
+    } catch (err) {
         await reload();
         showToast(`${act === 'add' ? 'Add' : 'Move'} failed: ${err.message}`, 'error');
       } finally {
@@ -1115,7 +1279,7 @@
         }));
         await editPlaylist(actions);
         showToast(`Removed ${ids.length} video${ids.length === 1 ? '' : 's'}`);
-      } catch (err) {
+    } catch (err) {
         await reload();
         showToast(`Failed: ${err.message}`, 'error');
       } finally {
@@ -1145,10 +1309,13 @@
     if (!isPlaylistPage()) { unmountRoot(); return; }
     const playlistId = new URLSearchParams(location.search).get('list');
     state.playlistId = playlistId;
+    state.nextUid = 1;
     state.selected.clear();
     state.lastClickedId = null;
     state.videos = [];
     state.loading = false;
+    if (state._nativeObserver) state._nativeObserver.disconnect();
+    clearTimeout(state._mutationTimer);
     // SPA navigation may have replaced the DOM — drop any stale ref to the
     // previous playlist's "hidden native" element.
     unhideNativeSection();
@@ -1221,9 +1388,50 @@
       setHeader();
 
       if (!videos.length) {
-        setEmpty('No videos found.');
-        // Keep native list visible as a fallback
-        return;
+        console.log('[Playlist Pro] API returned 0 videos. Attempting DOM scrape fallback...');
+        const scrapedVideos = scrapeVideosFromDom();
+        if (scrapedVideos.length > 0) {
+           console.log(`[Playlist Pro] DOM Scrape recovered ${scrapedVideos.length} videos.`);
+           state.videos = scrapedVideos;
+           state.ownerView = false; // explicitly read-only
+           hideNativeSection(nativeSection);
+           appendRows(0);
+           setHeader();
+        } else {
+           setEmpty('No videos found.');
+           // Keep native list visible as a fallback
+           return;
+        }
+      }
+      // Setup a MutationObserver to catch lazily loaded videos if YouTube continues loading them natively.
+      if (nativeSection) {
+        if (state._nativeObserver) state._nativeObserver.disconnect();
+        state._nativeObserver = new MutationObserver((mutations) => {
+          if (stale()) {
+            state._nativeObserver.disconnect();
+            return;
+          }
+          // Debounce the extraction
+          clearTimeout(state._mutationTimer);
+          state._mutationTimer = setTimeout(() => {
+            const currentCount = state.videos.length;
+            const newlyScraped = scrapeVideosFromDom();
+            let added = false;
+            for (const v of newlyScraped) {
+              // Deduplicate by videoId
+              if (!state.videos.find(existing => existing.videoId === v.videoId)) {
+                state.videos.push(v);
+                added = true;
+              }
+            }
+            if (added) {
+              console.log(`[Playlist Pro] MutationObserver found new videos. Total: ${state.videos.length}`);
+              appendRows(currentCount);
+              setHeader();
+            }
+          }, 500);
+        });
+        state._nativeObserver.observe(nativeSection, { childList: true, subtree: true });
       }
     } catch (err) {
       if (stale()) return;

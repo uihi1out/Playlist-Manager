@@ -3,7 +3,14 @@
 /* class applied to the specific YouTube section we're replacing.
    Targeted to a precise element rather than a broad CSS selector. */
 .ytpp-hide-native {
-  display: none !important;
+  /* Instead of display: none, we shrink it and make it visually hidden so IntersectionObservers can still fire if YouTube tries to lazy-load more videos */
+  position: absolute !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  height: 1px !important;
+  width: 1px !important;
+  overflow: hidden !important;
+  z-index: -1 !important;
 }
 
 /* root container fills the right column where YouTube's list used to be */
