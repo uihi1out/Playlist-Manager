@@ -301,7 +301,7 @@
   // Recursively search any object for the first continuation token we can find.
   // Used as a fallback when the path varies between YouTube backend versions.
   function findContinuationTokenDeep(obj, depth = 0) {
-    if (!obj || typeof obj !== 'object' || depth > 8) return null;
+    if (!obj || typeof obj !== 'object' || depth > 20) return null;
     // Direct hits we know about
     if (obj.continuationCommand?.token) return obj.continuationCommand.token;
     if (obj.nextContinuationData?.continuation) return obj.nextContinuationData.continuation;
@@ -1119,6 +1119,36 @@
       if (!actions.length) return;
       await editPlaylist(actions);
       showToast(`Moved ${movingIds.length} video${movingIds.length === 1 ? '' : 's'}`);
+      // Setup a MutationObserver to catch lazily loaded videos if YouTube continues loading them natively.
+      if (nativeSection) {
+        if (state._nativeObserver) state._nativeObserver.disconnect();
+        state._nativeObserver = new MutationObserver((mutations) => {
+          if (stale()) {
+            state._nativeObserver.disconnect();
+            return;
+          }
+          // Debounce the extraction
+          clearTimeout(state._mutationTimer);
+          state._mutationTimer = setTimeout(() => {
+            const currentCount = state.videos.length;
+            const newlyScraped = scrapeVideosFromDom();
+            let added = false;
+            for (const v of newlyScraped) {
+              // Deduplicate by videoId
+              if (!state.videos.find(existing => existing.videoId === v.videoId)) {
+                state.videos.push(v);
+                added = true;
+              }
+            }
+            if (added) {
+              console.log(`[Playlist Pro] MutationObserver found new videos. Total: ${state.videos.length}`);
+              appendRows(currentCount);
+              setHeader();
+            }
+          }, 500);
+        });
+        state._nativeObserver.observe(nativeSection, { childList: true, subtree: true });
+      }
     } catch (err) {
       console.error(err);
       state.videos = previous;
@@ -1186,7 +1216,37 @@
         const actions = buildMoveActions(previous, ids, 0);
         await editPlaylist(actions);
         showToast(`Moved ${ids.length} to top`);
-      } catch (err) {
+        // Setup a MutationObserver to catch lazily loaded videos if YouTube continues loading them natively.
+      if (nativeSection) {
+        if (state._nativeObserver) state._nativeObserver.disconnect();
+        state._nativeObserver = new MutationObserver((mutations) => {
+          if (stale()) {
+            state._nativeObserver.disconnect();
+            return;
+          }
+          // Debounce the extraction
+          clearTimeout(state._mutationTimer);
+          state._mutationTimer = setTimeout(() => {
+            const currentCount = state.videos.length;
+            const newlyScraped = scrapeVideosFromDom();
+            let added = false;
+            for (const v of newlyScraped) {
+              // Deduplicate by videoId
+              if (!state.videos.find(existing => existing.videoId === v.videoId)) {
+                state.videos.push(v);
+                added = true;
+              }
+            }
+            if (added) {
+              console.log(`[Playlist Pro] MutationObserver found new videos. Total: ${state.videos.length}`);
+              appendRows(currentCount);
+              setHeader();
+            }
+          }, 500);
+        });
+        state._nativeObserver.observe(nativeSection, { childList: true, subtree: true });
+      }
+    } catch (err) {
         await reload(); // reload to be safe on error
         showToast(`Failed: ${err.message}`, 'error');
       } finally {
@@ -1204,7 +1264,37 @@
         const actions = buildMoveActions(previous, ids, previous.length);
         await editPlaylist(actions);
         showToast(`Moved ${ids.length} to bottom`);
-      } catch (err) {
+        // Setup a MutationObserver to catch lazily loaded videos if YouTube continues loading them natively.
+      if (nativeSection) {
+        if (state._nativeObserver) state._nativeObserver.disconnect();
+        state._nativeObserver = new MutationObserver((mutations) => {
+          if (stale()) {
+            state._nativeObserver.disconnect();
+            return;
+          }
+          // Debounce the extraction
+          clearTimeout(state._mutationTimer);
+          state._mutationTimer = setTimeout(() => {
+            const currentCount = state.videos.length;
+            const newlyScraped = scrapeVideosFromDom();
+            let added = false;
+            for (const v of newlyScraped) {
+              // Deduplicate by videoId
+              if (!state.videos.find(existing => existing.videoId === v.videoId)) {
+                state.videos.push(v);
+                added = true;
+              }
+            }
+            if (added) {
+              console.log(`[Playlist Pro] MutationObserver found new videos. Total: ${state.videos.length}`);
+              appendRows(currentCount);
+              setHeader();
+            }
+          }, 500);
+        });
+        state._nativeObserver.observe(nativeSection, { childList: true, subtree: true });
+      }
+    } catch (err) {
         await reload();
         showToast(`Failed: ${err.message}`, 'error');
       } finally {
@@ -1224,7 +1314,37 @@
           .filter(p => p.playlistId !== state.playlistId);
         if (!playlists.length) { showToast('No other playlists found', 'error'); return; }
         target = await pickPlaylist(playlists);
-      } catch (err) {
+        // Setup a MutationObserver to catch lazily loaded videos if YouTube continues loading them natively.
+      if (nativeSection) {
+        if (state._nativeObserver) state._nativeObserver.disconnect();
+        state._nativeObserver = new MutationObserver((mutations) => {
+          if (stale()) {
+            state._nativeObserver.disconnect();
+            return;
+          }
+          // Debounce the extraction
+          clearTimeout(state._mutationTimer);
+          state._mutationTimer = setTimeout(() => {
+            const currentCount = state.videos.length;
+            const newlyScraped = scrapeVideosFromDom();
+            let added = false;
+            for (const v of newlyScraped) {
+              // Deduplicate by videoId
+              if (!state.videos.find(existing => existing.videoId === v.videoId)) {
+                state.videos.push(v);
+                added = true;
+              }
+            }
+            if (added) {
+              console.log(`[Playlist Pro] MutationObserver found new videos. Total: ${state.videos.length}`);
+              appendRows(currentCount);
+              setHeader();
+            }
+          }, 500);
+        });
+        state._nativeObserver.observe(nativeSection, { childList: true, subtree: true });
+      }
+    } catch (err) {
         showToast(`Couldn't load playlists: ${err.message}`, 'error');
         return;
       }
@@ -1254,7 +1374,37 @@
         renderList();
         await editPlaylist(ids.map(setVideoId => ({ action: 'ACTION_REMOVE_VIDEO', setVideoId })));
         showToast(`Moved ${ids.length} to "${target.title}"`);
-      } catch (err) {
+        // Setup a MutationObserver to catch lazily loaded videos if YouTube continues loading them natively.
+      if (nativeSection) {
+        if (state._nativeObserver) state._nativeObserver.disconnect();
+        state._nativeObserver = new MutationObserver((mutations) => {
+          if (stale()) {
+            state._nativeObserver.disconnect();
+            return;
+          }
+          // Debounce the extraction
+          clearTimeout(state._mutationTimer);
+          state._mutationTimer = setTimeout(() => {
+            const currentCount = state.videos.length;
+            const newlyScraped = scrapeVideosFromDom();
+            let added = false;
+            for (const v of newlyScraped) {
+              // Deduplicate by videoId
+              if (!state.videos.find(existing => existing.videoId === v.videoId)) {
+                state.videos.push(v);
+                added = true;
+              }
+            }
+            if (added) {
+              console.log(`[Playlist Pro] MutationObserver found new videos. Total: ${state.videos.length}`);
+              appendRows(currentCount);
+              setHeader();
+            }
+          }, 500);
+        });
+        state._nativeObserver.observe(nativeSection, { childList: true, subtree: true });
+      }
+    } catch (err) {
         await reload();
         showToast(`${act === 'add' ? 'Add' : 'Move'} failed: ${err.message}`, 'error');
       } finally {
@@ -1279,7 +1429,37 @@
         }));
         await editPlaylist(actions);
         showToast(`Removed ${ids.length} video${ids.length === 1 ? '' : 's'}`);
-      } catch (err) {
+        // Setup a MutationObserver to catch lazily loaded videos if YouTube continues loading them natively.
+      if (nativeSection) {
+        if (state._nativeObserver) state._nativeObserver.disconnect();
+        state._nativeObserver = new MutationObserver((mutations) => {
+          if (stale()) {
+            state._nativeObserver.disconnect();
+            return;
+          }
+          // Debounce the extraction
+          clearTimeout(state._mutationTimer);
+          state._mutationTimer = setTimeout(() => {
+            const currentCount = state.videos.length;
+            const newlyScraped = scrapeVideosFromDom();
+            let added = false;
+            for (const v of newlyScraped) {
+              // Deduplicate by videoId
+              if (!state.videos.find(existing => existing.videoId === v.videoId)) {
+                state.videos.push(v);
+                added = true;
+              }
+            }
+            if (added) {
+              console.log(`[Playlist Pro] MutationObserver found new videos. Total: ${state.videos.length}`);
+              appendRows(currentCount);
+              setHeader();
+            }
+          }, 500);
+        });
+        state._nativeObserver.observe(nativeSection, { childList: true, subtree: true });
+      }
+    } catch (err) {
         await reload();
         showToast(`Failed: ${err.message}`, 'error');
       } finally {
@@ -1314,6 +1494,8 @@
     state.lastClickedId = null;
     state.videos = [];
     state.loading = false;
+    if (state._nativeObserver) state._nativeObserver.disconnect();
+    clearTimeout(state._mutationTimer);
     // SPA navigation may have replaced the DOM — drop any stale ref to the
     // previous playlist's "hidden native" element.
     unhideNativeSection();
@@ -1400,6 +1582,36 @@
            // Keep native list visible as a fallback
            return;
         }
+      }
+      // Setup a MutationObserver to catch lazily loaded videos if YouTube continues loading them natively.
+      if (nativeSection) {
+        if (state._nativeObserver) state._nativeObserver.disconnect();
+        state._nativeObserver = new MutationObserver((mutations) => {
+          if (stale()) {
+            state._nativeObserver.disconnect();
+            return;
+          }
+          // Debounce the extraction
+          clearTimeout(state._mutationTimer);
+          state._mutationTimer = setTimeout(() => {
+            const currentCount = state.videos.length;
+            const newlyScraped = scrapeVideosFromDom();
+            let added = false;
+            for (const v of newlyScraped) {
+              // Deduplicate by videoId
+              if (!state.videos.find(existing => existing.videoId === v.videoId)) {
+                state.videos.push(v);
+                added = true;
+              }
+            }
+            if (added) {
+              console.log(`[Playlist Pro] MutationObserver found new videos. Total: ${state.videos.length}`);
+              appendRows(currentCount);
+              setHeader();
+            }
+          }, 500);
+        });
+        state._nativeObserver.observe(nativeSection, { childList: true, subtree: true });
       }
     } catch (err) {
       if (stale()) return;
