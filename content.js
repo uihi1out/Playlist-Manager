@@ -247,7 +247,38 @@
 
 
   function parseRow(r) {
-    if (!r || !r.videoId) return null;
+    if (!r) return null;
+
+    // Support for lockupViewModel
+    if (r.contentId) {
+      // Exclude generic IDs that aren't YouTube video IDs (typically length 11)
+      if (typeof r.contentId !== 'string' || r.contentId.length !== 11) return null;
+
+      const videoId = r.contentId;
+      const meta = r.metadata?.lockupMetadataViewModel || {};
+      const title = meta.title?.content || '';
+      // We don't want "Play All" or "Shuffle" generic collections to be parsed as videos
+      if (!title || title.toLowerCase() === 'play all' || title.toLowerCase() === 'shuffle') return null;
+
+      // Additional lockup parsing if needed
+      const thumbObj = r.image?.imageViewModel?.image?.sources?.[0];
+      const thumb = thumbObj ? thumbObj.url : `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
+
+      const channel = meta.metadata?.content || '';
+      // Lockups don't explicitly pass index in all cases, nor strict duration directly reliably in the same schema
+      const index = 0;
+      const duration = '';
+      const durationSec = 0;
+
+      return {
+        videoId,
+        uid: String(state.nextUid++),
+        setVideoId: null, // Generated/Recap items are read-only
+        title, channel, duration, durationSec, thumb, index
+      };
+    }
+
+    if (!r.videoId) return null;
     const titleRuns = r.title?.runs || [];
     const title = titleRuns.map(x => x.text).join('') || r.title?.simpleText || '';
     const channel = r.shortBylineText?.runs?.[0]?.text ||
@@ -296,15 +327,22 @@
   // reloadContinuationItemsCommand / continuationContents / whatever ships
   // next quarter) because those vary by backend version and an unrecognized
   // one silently truncated the playlist at the first page.
-  function collectVideosDeep(obj, out = [], depth = 0) {
+  function collectVideosDeep(obj, out = [], depth = 0, seen = new Set()) {
     if (!obj || typeof obj !== 'object' || depth > 16) return out;
-    const renderer = obj.playlistVideoRenderer || obj.playlistPanelVideoRenderer || obj.videoRenderer;
-    if (renderer && renderer.videoId) {
-      const v = parseRow(renderer);
-      if (v) out.push(v);
-      return out; // no videos nested inside a video
+    const renderer = obj.playlistVideoRenderer || obj.playlistPanelVideoRenderer || obj.videoRenderer || obj.lockupViewModel;
+    if (renderer) {
+      // Normal renderers have videoId, lockupViewModel has contentId
+      const id = renderer.videoId || renderer.contentId;
+      if (id && !seen.has(id)) {
+        const v = parseRow(renderer);
+        if (v) {
+          seen.add(id);
+          out.push(v);
+        }
+        return out; // no videos nested inside a video
+      }
     }
-    for (const k in obj) collectVideosDeep(obj[k], out, depth + 1);
+    for (const k in obj) collectVideosDeep(obj[k], out, depth + 1, seen);
     return out;
   }
 
