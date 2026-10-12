@@ -72,6 +72,27 @@
     while (el.firstChild) el.removeChild(el.firstChild);
   }
 
+  // ============================================================
+  // URL / ID VALIDATION — defense-in-depth sinks for values that
+  // come from network responses or the DOM and end up in `src`/`href`
+  // attributes. A malicious/compromised InnerTube response could
+  // otherwise smuggle a `javascript:`/`data:` URI into an <img src>
+  // or an <a href>, which is a script-execution vector in the MAIN
+  // world (full access to the page and, via fetch+cookies, to the
+  // user's YouTube session).
+  // ============================================================
+  const SAFE_URL_RE = /^https?:\/\//i;
+  const VIDEO_ID_RE = /^[a-zA-Z0-9_-]{11}$/;
+
+  function safeImageUrl(url, videoId) {
+    if (typeof url === 'string' && SAFE_URL_RE.test(url)) return url;
+    return `https://i.ytimg.com/vi/${encodeURIComponent(videoId)}/mqdefault.jpg`;
+  }
+
+  function isValidVideoId(id) {
+    return typeof id === 'string' && VIDEO_ID_RE.test(id);
+  }
+
   function setEmpty(msg) {
     if (!listEl) return;
     listEl.replaceChildren(h('div', { class: 'ytpp-empty' }, msg));
@@ -107,8 +128,14 @@
   }
 
   function readCookie(name) {
-    const m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^;]*)'));
-    return m ? m[1] : null;
+    // document.cookie can contain quotes and other regex-adjacent chars;
+    // match by splitting instead of building a RegExp from the value.
+    const prefix = name + '=';
+    for (const part of document.cookie.split(';')) {
+      const c = part.trimStart();
+      if (c.startsWith(prefix)) return c.slice(prefix.length);
+    }
+    return null;
   }
 
   async function sha1Hex(str) {
@@ -252,7 +279,7 @@
     // Support for lockupViewModel
     if (r.contentId) {
       // Exclude generic IDs that aren't YouTube video IDs (typically length 11)
-      if (typeof r.contentId !== 'string' || r.contentId.length !== 11) return null;
+      if (!isValidVideoId(r.contentId)) return null;
 
       const videoId = r.contentId;
       const meta = r.metadata?.lockupMetadataViewModel || {};
@@ -262,7 +289,7 @@
 
       // Additional lockup parsing if needed
       const thumbObj = r.image?.imageViewModel?.image?.sources?.[0];
-      const thumb = thumbObj ? thumbObj.url : `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
+      const thumb = safeImageUrl(thumbObj?.url, videoId);
 
       const channel = meta.metadata?.content || '';
       // Lockups don't explicitly pass index in all cases, nor strict duration directly reliably in the same schema
@@ -279,14 +306,14 @@
     }
 
     if (!r.videoId) return null;
+    if (!isValidVideoId(r.videoId)) return null; // reject malformed/injected IDs
     const titleRuns = r.title?.runs || [];
     const title = titleRuns.map(x => x.text).join('') || r.title?.simpleText || '';
     const channel = r.shortBylineText?.runs?.[0]?.text ||
                     r.videoInfo?.runs?.[0]?.text || '';
     const duration = r.lengthText?.simpleText || '';
     const durationSec = parseInt(r.lengthSeconds || '0', 10) || 0;
-    const thumb = r.thumbnail?.thumbnails?.[0]?.url ||
-                  `https://i.ytimg.com/vi/${r.videoId}/mqdefault.jpg`;
+    const thumb = safeImageUrl(r.thumbnail?.thumbnails?.[0]?.url, r.videoId);
     const idxStr = r.index?.simpleText || r.indexText?.simpleText || '0';
     const index = parseInt(idxStr, 10) || 0;
     return {
@@ -367,6 +394,7 @@
       const url = new URL(a.href, window.location.origin);
       const videoId = url.searchParams.get('v');
       if (!videoId) continue;
+      if (!isValidVideoId(videoId)) continue; // reject malformed/injected IDs
 
       const title = a.textContent.trim() || a.title;
       if (!title || title.toLowerCase() === 'play all' || title.toLowerCase() === 'shuffle') continue;
@@ -770,7 +798,11 @@
   function buildRow(v, i) {
     const isSelected = !!(v.uid && state.selected.has(v.uid));
     const canDrag = !!(state.ownerView && v.setVideoId);
-    const watchUrl = `/watch?v=${encodeURIComponent(v.videoId)}&list=${encodeURIComponent(state.playlistId)}&index=${i + 1}`;
+    // Never build a watch URL from an unvalidated ID: a malformed videoId
+    // (e.g. containing "?", "#" or other URL-breaking characters coming
+    // from scraped DOM hrefs) could redirect the link off /watch entirely.
+    const safeVid = isValidVideoId(v.videoId) ? v.videoId : '';
+    const watchUrl = `/watch?v=${encodeURIComponent(safeVid)}&list=${encodeURIComponent(state.playlistId || '')}&index=${i + 1}`;
 
     const children = [];
 
@@ -790,7 +822,9 @@
     children.push(h('span', { class: 'ytpp-num' }, String(i + 1)));
 
     const img = h('img', { class: 'ytpp-thumb', loading: 'lazy', alt: '' });
-    img.src = v.thumb;
+    // Re-validate at the sink: even if a stale/unvalidated value reached the
+    // state, only http(s) thumbnail URLs may ever land in an <img src>.
+    img.src = safeImageUrl(v.thumb, v.videoId);
     children.push(h('a', { class: 'ytpp-thumb-link', href: watchUrl }, [
       img,
       h('span', { class: 'ytpp-thumb-time' }, v.duration || ''),
