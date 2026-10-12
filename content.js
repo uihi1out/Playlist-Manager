@@ -1336,12 +1336,31 @@
   // its next await instead of appending its pages into the same list
   // (which showed up as rows 101-200 repeated after 200).
   let bootGen = 0;
+  let lastBootedUrl = null;   // URL that the current boot was started for
+  let lastBootedList = null;  // ?list= value that the current boot loaded
 
   async function boot(force = false) {
     const gen = ++bootGen;
     const stale = () => gen !== bootGen;
-    if (!isPlaylistPage()) { unmountRoot(); return; }
+    if (!isPlaylistPage()) {
+      unmountRoot();
+      lastBootedUrl = null;
+      lastBootedList = null;
+      return;
+    }
     const playlistId = new URLSearchParams(location.search).get('list');
+    // Skip redundant re-boots: same page + same playlist + already mounted.
+    // Without this, every yt-navigate-finish (e.g. opening a video from the
+    // mini-player overlay) restarts boot(), and the old instance's 5-second
+    // section-wait loop can time out and unmount our UI right after the new
+    // instance mounts it — which looked like "checkboxes disappear until I
+    // reload the page".
+    if (!force && root && document.body.contains(root) &&
+        location.href === lastBootedUrl && playlistId === lastBootedList) {
+      return;
+    }
+    lastBootedUrl = location.href;
+    lastBootedList = playlistId;
     state.playlistId = playlistId;
     state.nextUid = 1;
     state.selected.clear();
@@ -1353,6 +1372,12 @@
     // SPA navigation may have replaced the DOM — drop any stale ref to the
     // previous playlist's "hidden native" element.
     unhideNativeSection();
+
+    // If we're already mounted for this same playlist (e.g. the user hit
+    // Reload, or a re-trigger while YouTube tore down/rebuilt the page),
+    // keep the UI visible and just refresh the data underneath it instead
+    // of tearing everything down — avoids a blank flash / lost checkboxes.
+    const remounting = !!(root && document.body.contains(root));
 
     // Wait for the native section to exist (we use it as our mount anchor
     // and to hide the original list once we render). We do NOT wait for
@@ -1369,13 +1394,21 @@
 
     if (!nativeSection) {
       console.warn('[Playlist Pro] No native playlist section found; staying out of the way');
-      unmountRoot();
-      return;
+      // If we're already mounted (remount/refresh case), keep the existing UI
+      // alive rather than tearing it down — the anchor may just be slow.
+      if (!remounting || !root || !document.body.contains(root)) {
+        unmountRoot();
+        lastBootedUrl = null;
+        lastBootedList = null;
+        return;
+      }
     }
 
     ensureRoot();
     if (!mountRoot()) {
       console.warn('[Playlist Pro] Could not mount root');
+      lastBootedUrl = null;
+      lastBootedList = null;
       return;
     }
 
@@ -1485,11 +1518,32 @@
   }
 
   // ============================================================
-  // SPA NAVIGATION
+  // SPA NAVIGATION / TRIGGER WATCHDOG
   // ============================================================
   document.addEventListener('yt-navigate-finish', () => {
     setTimeout(() => boot(false), 300);
   });
+
+  // Safety net for the "sometimes it doesn't trigger until I reload the page"
+  // problem: yt-navigate-finish isn't always dispatched (YouTube soft-navigates
+  // to a playlist via history.pushState in some flows), and on hard loads the
+  // playlist list renderer can appear well after our initial wait loop gives
+  // up. This lightweight interval re-checks cheap conditions every 2s and only
+  // calls boot() when we're on a playlist page that ISN'T already handled —
+  // so it never disturbs a working mount.
+  setInterval(() => {
+    if (!isPlaylistPage()) return;
+    if (root && document.body.contains(root)) return;      // already mounted
+    if (state.loading) return;                             // a boot is in flight
+    const listId = new URLSearchParams(location.search).get('list');
+    if (listId === lastBootedList && findNativePlaylistSection()) {
+      // We bailed earlier (section not ready yet) but everything is here now.
+      boot(false);
+    } else if (listId !== lastBootedList) {
+      // Navigation happened without yt-navigate-finish firing.
+      boot(false);
+    }
+  }, 2000);
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => boot());
