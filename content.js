@@ -1338,6 +1338,29 @@
   let bootGen = 0;
   let lastBootedUrl = null;   // URL that the current boot was started for
   let lastBootedList = null;  // ?list= value that the current boot loaded
+  let lastNavType = null;     // e.type of the last yt-navigate-* event seen
+  let bootInFlight = false;   // true between boot() start and first UI mount
+
+  // YouTube's SPA navigation only updates the URL via history.pushState/
+  // replaceState — no popstate/hashchange fires. Wrapping those lets us react
+  // instantly when you open a playlist without a full page load (the case
+  // where the extension used to miss its trigger entirely).
+  function patchHistoryMethods() {
+    for (const method of ['pushState', 'replaceState']) {
+      const original = history[method];
+      if (typeof original !== 'function' || original.__ytppPatched) continue;
+      const wrapped = function (...args) {
+        const rv = original.apply(this, args);
+        try {
+          dispatchEvent(new Event('ytpp-location-changed'));
+        } catch (_) {}
+        return rv;
+      };
+      wrapped.__ytppPatched = true;
+      history[method] = wrapped;
+    }
+  }
+  patchHistoryMethods();
 
   async function boot(force = false) {
     const gen = ++bootGen;
@@ -1361,6 +1384,7 @@
     }
     lastBootedUrl = location.href;
     lastBootedList = playlistId;
+    bootInFlight = true;
     state.playlistId = playlistId;
     state.nextUid = 1;
     state.selected.clear();
@@ -1382,24 +1406,36 @@
     // Wait for the native section to exist (we use it as our mount anchor
     // and to hide the original list once we render). We do NOT wait for
     // ytInitialData here because on SPA navigation it stays stale forever.
+    // On SPA navigations YouTube keeps the PREVIOUS playlist's section in the
+    // DOM briefly while swapping content, so require that the section actually
+    // contains a row for the playlist we're now on before trusting it as our
+    // mount anchor / hiding target.
+    const urlMatches = () => location.search.includes(`list=${playlistId}`);
+    const sectionForThisPlaylist = () => {
+      const sec = findNativePlaylistSection();
+      if (!sec) return null;
+      return sec.querySelector(`a[href*="list=${playlistId}"]`) ? sec : null;
+    };
     let tries = 0;
     let nativeSection = null;
-    while (tries < 50) {
-      nativeSection = findNativePlaylistSection();
+    while (tries < 50 && urlMatches() && !stale()) {
+      nativeSection = sectionForThisPlaylist();
       if (nativeSection) break;
       await new Promise(r => setTimeout(r, 100));
       tries++;
     }
-    if (stale()) return;
+    if (stale() || !urlMatches()) return;
 
     if (!nativeSection) {
       console.warn('[Playlist Pro] No native playlist section found; staying out of the way');
       // If we're already mounted (remount/refresh case), keep the existing UI
       // alive rather than tearing it down — the anchor may just be slow.
       if (!remounting || !root || !document.body.contains(root)) {
-        unmountRoot();
-        lastBootedUrl = null;
-        lastBootedList = null;
+        // DON'T reset lastBootedList here: the watchdog below retries boot()
+        // automatically once YouTube finally renders the playlist section, so
+        // a slow SPA navigation no longer needs a manual page reload.
+        state.loading = false;
+        bootInFlight = false;
         return;
       }
     }
@@ -1407,10 +1443,18 @@
     ensureRoot();
     if (!mountRoot()) {
       console.warn('[Playlist Pro] Could not mount root');
-      lastBootedUrl = null;
-      lastBootedList = null;
+      // Same as above: leave the retry path open for the watchdog instead of
+      // requiring a full page reload.
+      state.loading = false;
+      bootInFlight = false;
       return;
     }
+    // UI is on screen — later fetch failures show inline errors, so the
+    // watchdog shouldn't re-boot anymore.
+    bootInFlight = false;
+    // Re-read the anchor AFTER mounting: on SPA navigations YouTube may have
+    // swapped the section between our earlier lookup and insertion.
+    nativeSection = sectionForThisPlaylist() || nativeSection;
 
     const info = gatherHeaderInfo();
     state.title = info.title;
@@ -1520,30 +1564,82 @@
   // ============================================================
   // SPA NAVIGATION / TRIGGER WATCHDOG
   // ============================================================
-  document.addEventListener('yt-navigate-finish', () => {
+  // "Open a playlist without a full page load" = YouTube's client-side
+  // navigation. It updates the URL with history.pushState/replaceState and
+  // (usually) dispatches yt-navigate-* events on `document`. We listen to all
+  // of those so boot() fires no matter which path YouTube takes:
+  //   - yt-navigate-start / -pages-loaded / -finish: SPA nav lifecycle.
+  //     On START we immediately unmount, because YouTube keeps rendering the
+  //     PREVIOUS playlist's DOM while swapping — leaving our old UI mounted
+  //     made it look like nothing happened on the new playlist.
+  //   - ytpp-location-changed: our pushState/replaceState wrapper. Catches
+  //     navigations where the yt-navigate-* events never fire.
+  //   - popstate: browser back/forward.
+  const onNavStart = () => {
+    lastNavType = 'yt-navigate-start';
+    if (isPlaylistPage()) return; // will mount when the section is ready
+    unmountRoot();
+    lastBootedUrl = null;
+    lastBootedList = null;
+  };
+  document.addEventListener('yt-navigate-start', onNavStart);
+  document.addEventListener('yt-navigate-pages-loaded', (e) => {
+    lastNavType = e.type;
+    setTimeout(() => boot(false), 150);
+  });
+  document.addEventListener('yt-navigate-finish', (e) => {
+    lastNavType = e.type;
     setTimeout(() => boot(false), 300);
   });
 
+  let navDebounce = null;
+  const onLocationChanged = () => {
+    clearTimeout(navDebounce);
+    navDebounce = setTimeout(() => boot(false), 250);
+  };
+  addEventListener('ytpp-location-changed', onLocationChanged);
+  addEventListener('popstate', onLocationChanged);
+
   // Safety net for the "sometimes it doesn't trigger until I reload the page"
-  // problem: yt-navigate-finish isn't always dispatched (YouTube soft-navigates
-  // to a playlist via history.pushState in some flows), and on hard loads the
-  // playlist list renderer can appear well after our initial wait loop gives
-  // up. This lightweight interval re-checks cheap conditions every 2s and only
-  // calls boot() when we're on a playlist page that ISN'T already handled —
-  // so it never disturbs a working mount.
+  // problem: none of the events above are guaranteed (YouTube soft-navigates
+  // in ways that skip them), and on slow loads the playlist renderer can
+  // appear well after our initial wait loop gives up. This lightweight
+  // interval re-checks cheap conditions every second and calls boot() when
+  // we're on a playlist page that ISN'T already handled — so it never
+  // disturbs a working mount.
+  let prevHref = location.href;
   setInterval(() => {
+    // Detect plain location.href assignments (no event fires for those).
+    const hrefChanged = location.href !== prevHref;
+    if (hrefChanged) {
+      prevHref = location.href;
+      // If a yt-navigate-* event already kicked off a boot for this
+      // navigation, just sync our bookkeeping; otherwise start one now.
+      if (lastNavType && bootInFlight) {
+        lastBootedUrl = location.href;
+        lastBootedList = new URLSearchParams(location.search).get('list');
+        return;
+      }
+      if (!isPlaylistPage()) {
+        unmountRoot();
+        lastBootedUrl = null;
+        lastBootedList = null;
+        return;
+      }
+      boot(false);
+      return;
+    }
     if (!isPlaylistPage()) return;
     if (root && document.body.contains(root)) return;      // already mounted
-    if (state.loading) return;                             // a boot is in flight
+    if (bootInFlight) return;                              // a boot is in flight
     const listId = new URLSearchParams(location.search).get('list');
-    if (listId === lastBootedList && findNativePlaylistSection()) {
-      // We bailed earlier (section not ready yet) but everything is here now.
-      boot(false);
-    } else if (listId !== lastBootedList) {
-      // Navigation happened without yt-navigate-finish firing.
+    if (findNativePlaylistSection()) {
+      // Either we bailed earlier (section wasn't ready yet) or we navigated
+      // here without any event firing. Retry automatically — no manual
+      // page reload needed anymore.
       boot(false);
     }
-  }, 2000);
+  }, 1000);
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => boot());

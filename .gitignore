@@ -1,0 +1,5 @@
+node_modules/
+*.log
+dbg_out.txt
+full_out.txt
+spa_out.txt
