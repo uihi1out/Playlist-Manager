@@ -72,6 +72,27 @@
     while (el.firstChild) el.removeChild(el.firstChild);
   }
 
+  // ============================================================
+  // URL / ID VALIDATION — defense-in-depth sinks for values that
+  // come from network responses or the DOM and end up in `src`/`href`
+  // attributes. A malicious/compromised InnerTube response could
+  // otherwise smuggle a `javascript:`/`data:` URI into an <img src>
+  // or an <a href>, which is a script-execution vector in the MAIN
+  // world (full access to the page and, via fetch+cookies, to the
+  // user's YouTube session).
+  // ============================================================
+  const SAFE_URL_RE = /^https?:\/\//i;
+  const VIDEO_ID_RE = /^[a-zA-Z0-9_-]{11}$/;
+
+  function safeImageUrl(url, videoId) {
+    if (typeof url === 'string' && SAFE_URL_RE.test(url)) return url;
+    return `https://i.ytimg.com/vi/${encodeURIComponent(videoId)}/mqdefault.jpg`;
+  }
+
+  function isValidVideoId(id) {
+    return typeof id === 'string' && VIDEO_ID_RE.test(id);
+  }
+
   function setEmpty(msg) {
     if (!listEl) return;
     listEl.replaceChildren(h('div', { class: 'ytpp-empty' }, msg));
@@ -107,8 +128,14 @@
   }
 
   function readCookie(name) {
-    const m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^;]*)'));
-    return m ? m[1] : null;
+    // document.cookie can contain quotes and other regex-adjacent chars;
+    // match by splitting instead of building a RegExp from the value.
+    const prefix = name + '=';
+    for (const part of document.cookie.split(';')) {
+      const c = part.trimStart();
+      if (c.startsWith(prefix)) return c.slice(prefix.length);
+    }
+    return null;
   }
 
   async function sha1Hex(str) {
@@ -252,7 +279,7 @@
     // Support for lockupViewModel
     if (r.contentId) {
       // Exclude generic IDs that aren't YouTube video IDs (typically length 11)
-      if (typeof r.contentId !== 'string' || r.contentId.length !== 11) return null;
+      if (!isValidVideoId(r.contentId)) return null;
 
       const videoId = r.contentId;
       const meta = r.metadata?.lockupMetadataViewModel || {};
@@ -262,7 +289,7 @@
 
       // Additional lockup parsing if needed
       const thumbObj = r.image?.imageViewModel?.image?.sources?.[0];
-      const thumb = thumbObj ? thumbObj.url : `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
+      const thumb = safeImageUrl(thumbObj?.url, videoId);
 
       const channel = meta.metadata?.content || '';
       // Lockups don't explicitly pass index in all cases, nor strict duration directly reliably in the same schema
@@ -279,14 +306,14 @@
     }
 
     if (!r.videoId) return null;
+    if (!isValidVideoId(r.videoId)) return null; // reject malformed/injected IDs
     const titleRuns = r.title?.runs || [];
     const title = titleRuns.map(x => x.text).join('') || r.title?.simpleText || '';
     const channel = r.shortBylineText?.runs?.[0]?.text ||
                     r.videoInfo?.runs?.[0]?.text || '';
     const duration = r.lengthText?.simpleText || '';
     const durationSec = parseInt(r.lengthSeconds || '0', 10) || 0;
-    const thumb = r.thumbnail?.thumbnails?.[0]?.url ||
-                  `https://i.ytimg.com/vi/${r.videoId}/mqdefault.jpg`;
+    const thumb = safeImageUrl(r.thumbnail?.thumbnails?.[0]?.url, r.videoId);
     const idxStr = r.index?.simpleText || r.indexText?.simpleText || '0';
     const index = parseInt(idxStr, 10) || 0;
     return {
@@ -367,6 +394,7 @@
       const url = new URL(a.href, window.location.origin);
       const videoId = url.searchParams.get('v');
       if (!videoId) continue;
+      if (!isValidVideoId(videoId)) continue; // reject malformed/injected IDs
 
       const title = a.textContent.trim() || a.title;
       if (!title || title.toLowerCase() === 'play all' || title.toLowerCase() === 'shuffle') continue;
@@ -770,7 +798,11 @@
   function buildRow(v, i) {
     const isSelected = !!(v.uid && state.selected.has(v.uid));
     const canDrag = !!(state.ownerView && v.setVideoId);
-    const watchUrl = `/watch?v=${encodeURIComponent(v.videoId)}&list=${encodeURIComponent(state.playlistId)}&index=${i + 1}`;
+    // Never build a watch URL from an unvalidated ID: a malformed videoId
+    // (e.g. containing "?", "#" or other URL-breaking characters coming
+    // from scraped DOM hrefs) could redirect the link off /watch entirely.
+    const safeVid = isValidVideoId(v.videoId) ? v.videoId : '';
+    const watchUrl = `/watch?v=${encodeURIComponent(safeVid)}&list=${encodeURIComponent(state.playlistId || '')}&index=${i + 1}`;
 
     const children = [];
 
@@ -790,7 +822,9 @@
     children.push(h('span', { class: 'ytpp-num' }, String(i + 1)));
 
     const img = h('img', { class: 'ytpp-thumb', loading: 'lazy', alt: '' });
-    img.src = v.thumb;
+    // Re-validate at the sink: even if a stale/unvalidated value reached the
+    // state, only http(s) thumbnail URLs may ever land in an <img src>.
+    img.src = safeImageUrl(v.thumb, v.videoId);
     children.push(h('a', { class: 'ytpp-thumb-link', href: watchUrl }, [
       img,
       h('span', { class: 'ytpp-thumb-time' }, v.duration || ''),
@@ -1302,12 +1336,55 @@
   // its next await instead of appending its pages into the same list
   // (which showed up as rows 101-200 repeated after 200).
   let bootGen = 0;
+  let lastBootedUrl = null;   // URL that the current boot was started for
+  let lastBootedList = null;  // ?list= value that the current boot loaded
+  let lastNavType = null;     // e.type of the last yt-navigate-* event seen
+  let bootInFlight = false;   // true between boot() start and first UI mount
+
+  // YouTube's SPA navigation only updates the URL via history.pushState/
+  // replaceState — no popstate/hashchange fires. Wrapping those lets us react
+  // instantly when you open a playlist without a full page load (the case
+  // where the extension used to miss its trigger entirely).
+  function patchHistoryMethods() {
+    for (const method of ['pushState', 'replaceState']) {
+      const original = history[method];
+      if (typeof original !== 'function' || original.__ytppPatched) continue;
+      const wrapped = function (...args) {
+        const rv = original.apply(this, args);
+        try {
+          dispatchEvent(new Event('ytpp-location-changed'));
+        } catch (_) {}
+        return rv;
+      };
+      wrapped.__ytppPatched = true;
+      history[method] = wrapped;
+    }
+  }
+  patchHistoryMethods();
 
   async function boot(force = false) {
     const gen = ++bootGen;
     const stale = () => gen !== bootGen;
-    if (!isPlaylistPage()) { unmountRoot(); return; }
+    if (!isPlaylistPage()) {
+      unmountRoot();
+      lastBootedUrl = null;
+      lastBootedList = null;
+      return;
+    }
     const playlistId = new URLSearchParams(location.search).get('list');
+    // Skip redundant re-boots: same page + same playlist + already mounted.
+    // Without this, every yt-navigate-finish (e.g. opening a video from the
+    // mini-player overlay) restarts boot(), and the old instance's 5-second
+    // section-wait loop can time out and unmount our UI right after the new
+    // instance mounts it — which looked like "checkboxes disappear until I
+    // reload the page".
+    if (!force && root && document.body.contains(root) &&
+        location.href === lastBootedUrl && playlistId === lastBootedList) {
+      return;
+    }
+    lastBootedUrl = location.href;
+    lastBootedList = playlistId;
+    bootInFlight = true;
     state.playlistId = playlistId;
     state.nextUid = 1;
     state.selected.clear();
@@ -1320,30 +1397,64 @@
     // previous playlist's "hidden native" element.
     unhideNativeSection();
 
+    // If we're already mounted for this same playlist (e.g. the user hit
+    // Reload, or a re-trigger while YouTube tore down/rebuilt the page),
+    // keep the UI visible and just refresh the data underneath it instead
+    // of tearing everything down — avoids a blank flash / lost checkboxes.
+    const remounting = !!(root && document.body.contains(root));
+
     // Wait for the native section to exist (we use it as our mount anchor
     // and to hide the original list once we render). We do NOT wait for
     // ytInitialData here because on SPA navigation it stays stale forever.
+    // On SPA navigations YouTube keeps the PREVIOUS playlist's section in the
+    // DOM briefly while swapping content, so require that the section actually
+    // contains a row for the playlist we're now on before trusting it as our
+    // mount anchor / hiding target.
+    const urlMatches = () => location.search.includes(`list=${playlistId}`);
+    const sectionForThisPlaylist = () => {
+      const sec = findNativePlaylistSection();
+      if (!sec) return null;
+      return sec.querySelector(`a[href*="list=${playlistId}"]`) ? sec : null;
+    };
     let tries = 0;
     let nativeSection = null;
-    while (tries < 50) {
-      nativeSection = findNativePlaylistSection();
+    while (tries < 50 && urlMatches() && !stale()) {
+      nativeSection = sectionForThisPlaylist();
       if (nativeSection) break;
       await new Promise(r => setTimeout(r, 100));
       tries++;
     }
-    if (stale()) return;
+    if (stale() || !urlMatches()) return;
 
     if (!nativeSection) {
       console.warn('[Playlist Pro] No native playlist section found; staying out of the way');
-      unmountRoot();
-      return;
+      // If we're already mounted (remount/refresh case), keep the existing UI
+      // alive rather than tearing it down — the anchor may just be slow.
+      if (!remounting || !root || !document.body.contains(root)) {
+        // DON'T reset lastBootedList here: the watchdog below retries boot()
+        // automatically once YouTube finally renders the playlist section, so
+        // a slow SPA navigation no longer needs a manual page reload.
+        state.loading = false;
+        bootInFlight = false;
+        return;
+      }
     }
 
     ensureRoot();
     if (!mountRoot()) {
       console.warn('[Playlist Pro] Could not mount root');
+      // Same as above: leave the retry path open for the watchdog instead of
+      // requiring a full page reload.
+      state.loading = false;
+      bootInFlight = false;
       return;
     }
+    // UI is on screen — later fetch failures show inline errors, so the
+    // watchdog shouldn't re-boot anymore.
+    bootInFlight = false;
+    // Re-read the anchor AFTER mounting: on SPA navigations YouTube may have
+    // swapped the section between our earlier lookup and insertion.
+    nativeSection = sectionForThisPlaylist() || nativeSection;
 
     const info = gatherHeaderInfo();
     state.title = info.title;
@@ -1451,11 +1562,84 @@
   }
 
   // ============================================================
-  // SPA NAVIGATION
+  // SPA NAVIGATION / TRIGGER WATCHDOG
   // ============================================================
-  document.addEventListener('yt-navigate-finish', () => {
+  // "Open a playlist without a full page load" = YouTube's client-side
+  // navigation. It updates the URL with history.pushState/replaceState and
+  // (usually) dispatches yt-navigate-* events on `document`. We listen to all
+  // of those so boot() fires no matter which path YouTube takes:
+  //   - yt-navigate-start / -pages-loaded / -finish: SPA nav lifecycle.
+  //     On START we immediately unmount, because YouTube keeps rendering the
+  //     PREVIOUS playlist's DOM while swapping — leaving our old UI mounted
+  //     made it look like nothing happened on the new playlist.
+  //   - ytpp-location-changed: our pushState/replaceState wrapper. Catches
+  //     navigations where the yt-navigate-* events never fire.
+  //   - popstate: browser back/forward.
+  const onNavStart = () => {
+    lastNavType = 'yt-navigate-start';
+    if (isPlaylistPage()) return; // will mount when the section is ready
+    unmountRoot();
+    lastBootedUrl = null;
+    lastBootedList = null;
+  };
+  document.addEventListener('yt-navigate-start', onNavStart);
+  document.addEventListener('yt-navigate-pages-loaded', (e) => {
+    lastNavType = e.type;
+    setTimeout(() => boot(false), 150);
+  });
+  document.addEventListener('yt-navigate-finish', (e) => {
+    lastNavType = e.type;
     setTimeout(() => boot(false), 300);
   });
+
+  let navDebounce = null;
+  const onLocationChanged = () => {
+    clearTimeout(navDebounce);
+    navDebounce = setTimeout(() => boot(false), 250);
+  };
+  addEventListener('ytpp-location-changed', onLocationChanged);
+  addEventListener('popstate', onLocationChanged);
+
+  // Safety net for the "sometimes it doesn't trigger until I reload the page"
+  // problem: none of the events above are guaranteed (YouTube soft-navigates
+  // in ways that skip them), and on slow loads the playlist renderer can
+  // appear well after our initial wait loop gives up. This lightweight
+  // interval re-checks cheap conditions every second and calls boot() when
+  // we're on a playlist page that ISN'T already handled — so it never
+  // disturbs a working mount.
+  let prevHref = location.href;
+  setInterval(() => {
+    // Detect plain location.href assignments (no event fires for those).
+    const hrefChanged = location.href !== prevHref;
+    if (hrefChanged) {
+      prevHref = location.href;
+      // If a yt-navigate-* event already kicked off a boot for this
+      // navigation, just sync our bookkeeping; otherwise start one now.
+      if (lastNavType && bootInFlight) {
+        lastBootedUrl = location.href;
+        lastBootedList = new URLSearchParams(location.search).get('list');
+        return;
+      }
+      if (!isPlaylistPage()) {
+        unmountRoot();
+        lastBootedUrl = null;
+        lastBootedList = null;
+        return;
+      }
+      boot(false);
+      return;
+    }
+    if (!isPlaylistPage()) return;
+    if (root && document.body.contains(root)) return;      // already mounted
+    if (bootInFlight) return;                              // a boot is in flight
+    const listId = new URLSearchParams(location.search).get('list');
+    if (findNativePlaylistSection()) {
+      // Either we bailed earlier (section wasn't ready yet) or we navigated
+      // here without any event firing. Retry automatically — no manual
+      // page reload needed anymore.
+      boot(false);
+    }
+  }, 1000);
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => boot());
